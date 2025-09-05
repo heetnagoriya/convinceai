@@ -3,74 +3,66 @@ package com.convinceai.recommendationservice.service;
 import com.convinceai.recommendationservice.client.InventoryClient;
 import com.convinceai.recommendationservice.client.PersuasionClient;
 import com.convinceai.recommendationservice.client.ProductCatalogClient;
-import com.convinceai.recommendationservice.dto.Product;
-import com.convinceai.recommendationservice.dto.ProductInfo;
-import com.convinceai.recommendationservice.dto.PersuasionRequest;
+import com.convinceai.recommendationservice.dto.*;
 import org.springframework.stereotype.Service;
-import reactor.core.publisher.Mono;
+import java.util.Optional;
 
 @Service
 public class RecommendationService {
-
     private final ProductCatalogClient productCatalogClient;
     private final InventoryClient inventoryClient;
-    private final PersuasionClient persuasionClient; // <-- NEW
+    private final PersuasionClient persuasionClient;
 
-    public RecommendationService(ProductCatalogClient productCatalogClient, InventoryClient inventoryClient, PersuasionClient persuasionClient) {
-        this.productCatalogClient = productCatalogClient;
-        this.inventoryClient = inventoryClient;
-        this.persuasionClient = persuasionClient; // <-- NEW
+    public RecommendationService(ProductCatalogClient p, InventoryClient i, PersuasionClient persuasionClient) {
+        this.productCatalogClient = p;
+        this.inventoryClient = i;
+        this.persuasionClient = persuasionClient;
     }
 
-    // THIS IS OUR NEW MASTER METHOD
-    public Mono<String> orchestrateConvinceFlow(String productId) {
-        // Step 1: Check inventory
-        return inventoryClient.getInventoryByProductId(productId)
-                .flatMap(inventoryItem -> {
-                    // Step 2: If item is in stock, return a simple success message.
-                    if (inventoryItem.getQuantity() > 0) {
-                        return Mono.just("Product is in stock. Added to cart.");
-                    }
-                    
-                    // Step 3: If out of stock, start the ConvinceAI flow
-                    return findRecommendationAndPersuade(productId);
-                });
+    public ConvinceResponse orchestrateConvinceFlow(String productId) {
+        Optional<InventoryItem> inventoryOpt = inventoryClient.getInventoryByProductId(productId);
+        if (inventoryOpt.isPresent() && inventoryOpt.get().getQuantity() > 0) {
+            return new ConvinceResponse("stock", "Product is in stock. Added to cart.", null);
+        }
+
+        Optional<Product> originalProductOpt = productCatalogClient.getProductById(productId);
+        if (originalProductOpt.isEmpty()) {
+            return new ConvinceResponse("error", "Product not found.", null);
+        }
+        Product originalProduct = originalProductOpt.get();
+
+        Optional<Product> recommendationOpt = findPairedRecommendation(originalProduct)
+                .or(() -> findInCategoryRecommendation(originalProduct));
+
+        if (recommendationOpt.isEmpty()) {
+            return new ConvinceResponse("error", "Sorry, we couldn't find a suitable in-stock alternative right now.", null);
+        }
+        Product recommendation = recommendationOpt.get();
+
+        ProductInfo originalInfo = new ProductInfo(originalProduct.getName(), originalProduct.getCategory(), originalProduct.getDescription(), originalProduct.getPrice(), 150, "Some ingredients");
+        ProductInfo recommendationInfo = new ProductInfo(recommendation.getName(), recommendation.getCategory(), recommendation.getDescription(), recommendation.getPrice(), 160, "Other ingredients");
+        PersuasionRequest persuasionRequest = new PersuasionRequest(originalInfo, recommendationInfo);
+
+        String aiMessage = persuasionClient.getPersuasion(persuasionRequest)
+                .map(response -> response.message())
+                .orElse("Sorry, there was an issue generating a recommendation.");
+
+        return new ConvinceResponse("recommendation", aiMessage, recommendation);
     }
 
-    private Mono<String> findRecommendationAndPersuade(String outOfStockProductId) {
-        // Get details of the out-of-stock product
-        Mono<Product> originalProductMono = productCatalogClient.getProductById(outOfStockProductId).cache();
-
-        // Find an in-stock recommendation
-        Mono<Product> recommendationMono = originalProductMono
-                .flatMap(outOfStockProduct -> 
-                    productCatalogClient.getProductsByCategory(outOfStockProduct.getCategory())
-                        .filter(candidate -> !candidate.getProductId().equals(outOfStockProductId))
-                        .next() // Get the first alternative
-                        .flatMap(this::checkInventory)
-                );
-
-        // When we have both products, call the persuasion service
-        return Mono.zip(originalProductMono, recommendationMono)
-                .flatMap(tuple -> {
-                    Product original = tuple.getT1();
-                    Product recommendation = tuple.getT2();
-                    
-                    // Create the DTOs needed by the persuasion service
-                    ProductInfo originalInfo = new ProductInfo(original.getName(), original.getCategory(), original.getDescription(), original.getPrice(), 0, ""); // Dummy values for now
-                    ProductInfo recommendationInfo = new ProductInfo(recommendation.getName(), recommendation.getCategory(), recommendation.getDescription(), recommendation.getPrice(), 0, ""); // Dummy values for now
-
-                    PersuasionRequest persuasionRequest = new PersuasionRequest(originalInfo, recommendationInfo);
-                    
-                    return persuasionClient.getPersuasion(persuasionRequest)
-                            .map(persuasionResponse -> persuasionResponse.message()); // Return just the AI's message
-                })
-                .defaultIfEmpty("Sorry, we couldn't find a suitable in-stock alternative right now.");
+    private Optional<Product> findPairedRecommendation(Product originalProduct) {
+        String recommendedId = originalProduct.getRecommendedProductId();
+        if (recommendedId == null || recommendedId.isEmpty()) return Optional.empty();
+        return productCatalogClient.getProductById(recommendedId)
+                .filter(rec -> inventoryClient.getInventoryByProductId(rec.getProductId())
+                        .map(inv -> inv.getQuantity() > 0).orElse(false));
     }
 
-    private Mono<Product> checkInventory(Product candidate) {
-        return inventoryClient.getInventoryByProductId(candidate.getProductId())
-                .filter(inventoryItem -> inventoryItem.getQuantity() > 0)
-                .map(inventoryItem -> candidate);
+    private Optional<Product> findInCategoryRecommendation(Product originalProduct) {
+         return productCatalogClient.getProductsByCategory(originalProduct.getCategory()).stream()
+                .filter(candidate -> !candidate.getProductId().equals(originalProduct.getProductId()))
+                .filter(candidate -> inventoryClient.getInventoryByProductId(candidate.getProductId())
+                        .map(inv -> inv.getQuantity() > 0).orElse(false))
+                .findFirst();
     }
 }

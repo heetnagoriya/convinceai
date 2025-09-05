@@ -14,7 +14,8 @@ public class Product {
     private String name;
     private String description;
     private Double price;
-    private String category; // <-- NEW FIELD ADDED
+    private String category;
+    private String recommendedProductId;
 
     @DynamoDbPartitionKey
     public String getProductId() {
